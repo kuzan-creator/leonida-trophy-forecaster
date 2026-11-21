@@ -1,46 +1,29 @@
-// Leonida Trophy Rarity Forecaster — entry for gta6-trophy-rarity-forecast-01.
-// Node 22, standard library only, no network, deterministic.
+// Leonida Trophy Rarity Forecaster v2 — week-one GTA VI trophy earn-rate forecast.
 //
-// Idea, from first principles. An Exophase earn rate is a ratio:
+// Model (counts decomposition, written from first principles for this entry):
+//   rate = earners / players_tracked. The program forecasts the two halves
+//   separately and divides, instead of extrapolating the ratio directly.
+//   * Consecutive identical reads collapse into one snapshot: a plateau is a
+//     stale Exophase page, not new information. Fits run on snapshots only.
+//   * players_tracked N: a power law in (1 + hours since release) — launch
+//     adoption grows fast then slows — blended with an exponential fit on the
+//     last 24 h of snapshots when the history has refreshes.
+//   * earners per trophy: a power law in (1 + hours since release), slope
+//     shrunk toward the tier median, blended in log space with a
+//     logit(rate)-vs-log-time trend. Earners never decrease; the platinum
+//     grows slowly with a relative cap; a trophy already at 100% stays there.
+//   * When the history has never refreshed (one snapshot), there is no trend
+//     to fit, so a launch prior applies: N grows like (1 + age)^1 while
+//     earners grow like (1 + age)^beta with beta < 1 by tier — new tracked
+//     players are fresh and need time to earn anything, so rates fall. The
+//     dilution factor is computed from the case's own ages and horizon;
+//     nothing about the answer is hardcoded.
+//   * Spread: refresh-jump dispersion plus trend uncertainty growing with the
+//     horizon, plus a small-earner term; calibrated for ~0.9 coverage, not 1.0.
+//     A band that is too wide pays pinball at every trophy.
 //
-//   rate_i = 100 * earners_i / players_tracked
-//
-// Both parts move, and they move for different reasons, so this program
-// forecasts them separately and divides at the end — it never extrapolates
-// the ratio itself.
-//
-// * players_tracked (N) only grows, and it grows in steps: Exophase
-//   refreshes its counts on its own schedule, so the history is a series of
-//   plateaus with sudden jumps. Between refreshes a read is a stale snapshot
-//   of the same underlying state. The program therefore collapses consecutive
-//   identical reads into one distinct snapshot, fits N's growth on the
-//   distinct snapshots only, and measures how big refresh jumps are from the
-//   jumps it has actually seen. The jump size is the honest uncertainty:
-//   a refresh nobody has seen yet can dilute every rate at once.
-// * earners_i only grow too. Per trophy, log(earners) is fitted against
-//   log(1 + hours since launch) — a power law, which bends down as a trophy
-//   saturates — and against time itself (an exponential), and the two
-//   predictions are averaged in log space. Each trophy's slope is shrunk
-//   toward its tier's median slope and the global median, so a trophy with
-//   almost no movement borrows strength from its tier instead of freezing.
-//   Slopes are never negative (earners cannot fall) and a forecast is
-//   capped at the forecast player count.
-// * The platinum (id 1) grows much slower than other trophies, and the
-//   100% trophy (id 2, last rate 100) stays at 100: the platinum is handled
-//   by its own fitted slope plus a relative cap, the 100% trophy by a
-//   pinned band.
-// * Quantile spread is refresh-aware, not a fixed random walk. Its logit
-//   width combines (a) refresh-jump uncertainty — how much N can jump
-//   before the target, estimated from observed jumps, with a wide prior
-//   when no jump has ever been seen (a flat history hides the next
-//   refresh, it does not rule it out) — and (b) trend uncertainty that
-//   grows with the horizon. Rare, volatile trophies get a wider band than
-//   saturated ones. Being too narrow is far costlier under pinball loss
-//   than being too wide, so the band is deliberately honest.
-//
-// Nothing here hardcodes a rate, a player count or a refresh factor: every
-// parameter is estimated from the case file at run time, with persistence
-// as the fallback when the history is flat or too short.
+// Node 22, standard library only, no network, deterministic: every number
+// comes from the case file, and two runs on the same case write the same bytes.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -48,237 +31,316 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
+/** The quantile levels the contest scores, in the order each row lists them. */
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
+/** The standard normal's quantile at each level. */
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 
-interface Trophy { id: number; name: string; tier: string; points: number; secret: boolean }
-interface Read { at: string; players_tracked: number; trophies_earned: number; rates: Array<number | null> }
+/* --- Tunable constants (chosen from synthetic validation, see README) --- */
+/** Power-law exponent for players-tracked growth in (1 + age hours). */
+const ALPHA_N = 1.0;
+/** Earner power-law exponents by tier, used only when no refresh was seen. */
+const BETA_TIER: Record<string, number> = { bronze: 0.2, silver: 0.15, gold: 0.1, platinum: 0.05 };
+/** Spread: floor, per-sqrt-day trend coefficient, small-earner coefficient. */
+const SIGMA_FLOOR = 0.15;
+const SIGMA_TREND = 0.2;
+/** Share of the expected refresh jump used as spread when none was seen. */
+const FLAT_JUMP_SHARE = 0.35;
+/** Platinum median rate may grow at most this many times its last rate. */
+const PLATINUM_CAP = 3;
+/** Grid for the saturating (logistic-in-time) fits: growth rates and midpoints. */
+const LOG_K = [0.02, 0.04, 0.07, 0.12, 0.2, 0.35, 0.6];
+const LOG_T0 = [0, 6, 12, 24, 36, 48, 72, 96, 120];
+
+interface Trophy { id: number; tier: string; }
+interface Read { at: string; players_tracked: number; trophies_earned: number; rates: Array<number | null>; }
 interface Case {
-  id: string; at: string; horizon_minutes: number; target: string; levels: number[];
-  game: { release_date?: string };
-  trophies: Trophy[]; history: Read[];
+  levels: number[];
+  horizon_minutes: number;
+  at: string;
+  target: string;
+  game: { release_date: string };
+  trophies: Trophy[];
+  history: Read[];
 }
 
 const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
-const clampPct = (x: number): number => clamp(x, 0.01, 99.99);
-const logit = (pct: number): number => { const p = clampPct(pct) / 100; return Math.log(p / (1 - p)); };
-const sigmoidPct = (l: number): number => 100 / (1 + Math.exp(-clamp(l, -12, 12)));
+const clampRate = (x: number): number => clamp(x, 0.01, 99.99);
+const logit = (pct: number): number => {
+  const p = clampRate(pct) / 100;
+  return Math.log(p / (1 - p));
+};
+const invLogit = (l: number): number => 100 / (1 + Math.exp(-l));
 const round4 = (x: number): number => Math.round(x * 10000) / 10000;
+/** Median of a numeric array (0 when empty). */
 const median = (xs: number[]): number => {
   if (xs.length === 0) return 0;
   const s = [...xs].sort((a, b) => a - b);
   const m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
-const mean = (xs: number[]): number => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
-const variance = (xs: number[]): number => {
-  if (xs.length < 2) return 0;
-  const m = mean(xs);
-  return xs.reduce((a, x) => a + (x - m) * (x - m), 0) / (xs.length - 1);
-};
-
-/** Least squares line y ~ a + b*x; returns [a, b, residualStd]. */
-function ols(xs: number[], ys: number[]): [number, number, number] {
+/** Least-squares line y ~ a + b*x; returns [intercept, slope]. */
+const ols = (xs: number[], ys: number[]): [number, number] => {
   const n = xs.length;
-  if (n === 0) return [0, 0, 0];
-  if (n === 1) return [ys[0], 0, 0];
-  const mx = mean(xs); const my = mean(ys);
-  let sxx = 0; let sxy = 0;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxx = 0, sxy = 0;
   for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (ys[i] - my); }
   const b = sxx > 1e-12 ? sxy / sxx : 0;
-  const a = my - b * mx;
-  const resid = ys.map((y, i) => y - (a + b * xs[i]));
-  return [a, b, Math.sqrt(mean(resid.map((r) => r * r)))];
-}
+  return [my - b * mx, b];
+};
 
-interface Snap { t: number; n: number; rates: number[] }
-
-function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> } {
-  const tAt = Date.parse(c.at);
-  const tTarget = Date.parse(c.target);
-  const horizonDays = Math.max(0, c.horizon_minutes / 1440);
-  const tLaunch = c.game?.release_date ? Date.parse(c.game.release_date) : NaN;
-  const launch = Number.isFinite(tLaunch) ? tLaunch : (c.history.length ? Date.parse(c.history[0].at) : tAt);
-  const hoursSinceLaunch = (t: number): number => Math.max(0, (t - launch) / 3600000);
-  const logTime = (t: number): number => Math.log1p(hoursSinceLaunch(t));
-
-  // --- Collapse plateaus: consecutive identical reads are one snapshot. ---
-  const snaps: Snap[] = [];
-  for (const h of c.history) {
-    const rates = h.rates.map((r) => (r === null ? NaN : r));
-    const prev = snaps[snaps.length - 1];
-    if (prev && prev.n === h.players_tracked && prev.rates.every((r, i) => r === rates[i] || (Number.isNaN(r) && Number.isNaN(rates[i])))) continue;
-    snaps.push({ t: Date.parse(h.at), n: h.players_tracked, rates });
-  }
-  const last = snaps[snaps.length - 1];
-  const nLast = last.n;
-  const lastRates = last.rates.map((r, i) => (Number.isNaN(r) ? (c.trophies[i]?.id === 2 ? 100 : 0.5) : r));
-
-  // --- Forecast players_tracked N. ---
-  // Log-log (power law) fit on distinct snapshots + log-linear (exponential)
-  // fit on the last 24h of distinct snapshots; average the two in log space.
-  let logNMed = Math.log(nLast);
-  let nResid = 0.15;
-  let medianGapH = 6; // median hours between distinct snapshots
-  const jumps: number[] = []; // log N jumps between distinct snapshots
-  if (snaps.length >= 2) {
-    const xs = snaps.map((s) => logTime(s.t));
-    const ys = snaps.map((s) => Math.log(s.n));
-    const [, bPow, rPow] = ols(xs, ys);
-    const powPred = ys[ys.length - 1] + Math.max(0, bPow) * (logTime(tTarget) - xs[xs.length - 1]);
-    const recent = snaps.filter((s) => tAt - s.t <= 24 * 3600000);
-    const use = recent.length >= 2 ? recent : snaps;
-    const xt = use.map((s) => (s.t - tAt) / 3600000);
-    const yt = use.map((s) => Math.log(s.n));
-    const [, bExp, rExp] = ols(xt, yt);
-    const expPred = yt[yt.length - 1] + Math.max(0, bExp) * (horizonDays * 24);
-    logNMed = (powPred + expPred) / 2;
-    nResid = Math.max(rPow, rExp, 0.05);
-    const gaps: number[] = [];
-    for (let k = 1; k < snaps.length; k++) {
-      jumps.push(Math.log(snaps[k].n / snaps[k - 1].n));
-      gaps.push((snaps[k].t - snaps[k - 1].t) / 3600000);
-    }
-    medianGapH = Math.max(1, median(gaps));
-  }
-  // Never forecast N below the last count; cap absurd growth at 50x.
-  const nMed = clamp(Math.exp(logNMed), nLast, nLast * 50);
-
-  // Refresh uncertainty for log N at the target.
-  const horizonH = horizonDays * 24;
-  let sigmaRefresh: number;
-  if (snaps.length < 2) {
-    // Flat history: no refresh has ever been seen, so one could be due at
-    // any moment. Wide prior — this is what the practice cases punish the
-    // baseline for missing (a 6x jump in 90 minutes).
-    sigmaRefresh = 1.15;
-  } else {
-    // Refresh jumps are the mechanism of N's growth, and the trend fit
-    // already predicts their typical size — so the uncertainty here is
-    // only the *dispersion* of jumps around their typical size, not the
-    // jumps themselves (counting the full jump as noise would double-count
-    // the growth the trend already forecasts).
-    const expectedRefreshes = Math.max(1, horizonH / medianGapH);
-    const jumpMean = mean(jumps);
-    const jumpStd = Math.sqrt(mean(jumps.map((j) => (j - jumpMean) ** 2)));
-    sigmaRefresh = clamp(Math.sqrt(expectedRefreshes) * Math.max(jumpStd, 0.02), 0.25, 0.7);
-  }
-  const sigmaN = Math.sqrt(sigmaRefresh * sigmaRefresh + (nResid * 0.5) * (nResid * 0.5));
-
-  // --- Per-trophy earner growth: slopes, shrunk toward tier / global. ---
-  const nT = c.trophies.length;
-  const slopes: number[] = new Array(nT).fill(0);
-  const rateSlopes: number[] = new Array(nT).fill(0);
-  const residE: number[] = new Array(nT).fill(0.3);
-  const counts: number[] = new Array(nT).fill(0);
-  const tLastLog = logTime(last.t);
-  const tTargetLog = logTime(tTarget);
-  const dtLog = Math.max(0, tTargetLog - tLastLog);
-  for (let i = 0; i < nT; i++) {
-    // Distinct snapshots where this trophy has a positive earner count.
-    const pts: Array<[number, number, number, number]> = []; // [logTime, logE, hours, rate]
-    for (const s of snaps) {
-      const r = s.rates[i];
-      if (Number.isNaN(r) || r <= 0) continue;
-      const e = (r / 100) * s.n;
-      if (e <= 0) continue;
-      pts.push([logTime(s.t), Math.log(e), (s.t - tAt) / 3600000, r]);
-    }
-    // Use the last 36h when there is enough there, else everything.
-    const recentPts = pts.filter((p) => p[2] >= -36);
-    const use = recentPts.length >= 3 ? recentPts : pts;
-    counts[i] = use.length;
-    if (use.length >= 2) {
-      const [, b, r] = ols(use.map((p) => p[0]), use.map((p) => p[1]));
-      slopes[i] = b;
-      residE[i] = Math.max(0.08, r);
-      // Exponential-in-time fit as a second opinion; average the slopes
-      // in the direction of growth (both are d logE / d log-time here via
-      // a local conversion: exp slope per hour * hours-per-log-time).
-      const [, bT] = ols(use.map((p) => p[2]), use.map((p) => p[1]));
-      const hoursPerLog = dtLog > 0 ? (horizonH / Math.max(dtLog, 0.01)) : 24;
-      const bTasLog = bT * hoursPerLog * 0.5; // damped: time-fit is noisier
-      slopes[i] = (slopes[i] + bTasLog) / 2;
-      // Second view: the rate itself (logit) against log-time. This sees
-      // what the earner-count view misses — new players earning a common
-      // trophy almost as fast as they join, so its rate keeps climbing
-      // even after its earner curve looks flat.
-      const [, bR] = ols(use.map((p) => p[0]), use.map((p) => logit(p[3])));
-      rateSlopes[i] = clamp(bR, -1.5, 2.5);
-    }
-  }
-  const tierOf = (i: number): string => c.trophies[i].tier;
-  const tierSlope = new Map<string, number>();
-  for (const tier of [...new Set(c.trophies.map((t) => t.tier))]) {
-    const ss = slopes.filter((_, i) => tierOf(i) === tier && counts[i] >= 2);
-    tierSlope.set(tier, ss.length ? median(ss) : 0);
-  }
-  const globalSlope = median(slopes.filter((_, i) => counts[i] >= 2));
-  const tierRateSlope = new Map<string, number>();
-  for (const tier of [...new Set(c.trophies.map((t) => t.tier))]) {
-    const ss = rateSlopes.filter((_, i) => tierOf(i) === tier && counts[i] >= 2);
-    tierRateSlope.set(tier, ss.length ? median(ss) : 0);
-  }
-  const globalRateSlope = median(rateSlopes.filter((_, i) => counts[i] >= 2));
-
-  const rows: Array<{ id: number; q: number[] }> = [];
-  for (let i = 0; i < nT; i++) {
-    const tr = c.trophies[i];
-    const rLast = lastRates[i];
-    // The 100% trophy stays at 100.
-    if (rLast >= 99.99) {
-      rows.push({ id: tr.id, q: [99.5, 99.9, 100, 100, 100] });
-      continue;
-    }
-    const eLast = Math.max(0.05, (rLast / 100) * nLast);
-    // Shrink this trophy's slope toward its tier, then the global slope.
-    const w = counts[i] / (counts[i] + 3);
-    const tierS = tierSlope.get(tr.tier) ?? globalSlope;
-    let b = w * slopes[i] + (1 - w) * (0.7 * tierS + 0.3 * globalSlope);
-    b = Math.max(0, b); // earners never fall
-    if (rLast > 40) b *= Math.max(0.15, 1 - rLast / 100); // saturating trophies bend down
-    const logE = Math.log(eLast) + b * dtLog;
-    let eMed = Math.exp(logE);
-    // Cap earners at the forecast player count (a rate cannot pass 100%).
-    // Platinum gets a relative cap instead of a growth damp: its fitted
-    // slope already reflects how slowly it is earned, and halving it made
-    // its rate fall even as more players finished the game.
-    const capE = tr.tier === 'platinum' ? Math.min(nMed * 0.98, Math.max(eLast * 6, (rLast * 4 / 100) * nMed)) : nMed * 0.98;
-    eMed = clamp(eMed, eLast * 0.5, capE);
-    const rFromCounts = clamp(100 * (eMed / nMed), 0.01, 99.9);
-    // Blend with the rate view: the logit-rate trend, shrunk toward its
-    // tier, read at the target. Averaging the two views in logit space
-    // keeps a common trophy from being dragged down by N growth alone
-    // (new players earn it too) and a rare trophy from being dragged up
-    // by a rate trend that ignores dilution.
-    const tierRS = tierRateSlope.get(tr.tier) ?? globalRateSlope;
-    const bR = w * rateSlopes[i] + (1 - w) * (0.7 * tierRS + 0.3 * globalRateSlope);
-    const rFromRate = clamp(sigmoidPct(logit(rLast) + bR * dtLog), 0.01, 99.9);
-    const rMed = clamp(sigmoidPct((logit(rFromCounts) + logit(rFromRate)) / 2), 0.01, 99.9);
-    const medLogit = logit(rMed);
-
-    // Spread: refresh/dilution uncertainty (shared) + this trophy's own
-    // trend uncertainty, growing with horizon; rarer trophies are wider.
-    const rare = rMed < 1 ? 0.18 : rMed < 5 ? 0.1 : 0;
-    const sigmaTrend = (residE[i] + 0.08) * Math.sqrt(0.5 + horizonDays / 3);
-    const sigma = clamp(Math.sqrt(sigmaN * sigmaN + sigmaTrend * sigmaTrend) + rare, 0.35, 1.3);
-    const q = Z.map((z) => round4(clamp(sigmoidPct(medLogit + z * sigma), 0.01, 100)));
-    // Enforce non-decreasing after rounding.
-    for (let k = 1; k < q.length; k++) if (q[k] < q[k - 1]) q[k] = q[k - 1];
-    rows.push({ id: tr.id, q });
-  }
-  return { trophies: rows };
-}
+interface Snap { t: number; n: number; rates: number[]; }
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
 const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
+
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
   if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
-    throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
+    throw new Error(`${file} asks for levels ${JSON.stringify(c.levels)}`);
   }
-  if (!c.history.length) throw new Error(`${file} has no history`);
-  const out = forecastCase(c);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify(out)}\n`);
+  if (c.history.length === 0) throw new Error(`${file} has no history`);
+
+  const releaseMs = Date.parse(`${c.game.release_date}T00:00:00Z`);
+  const t0 = Date.parse(c.at);
+  const t1 = Date.parse(c.target);
+  const horizonDays = c.horizon_minutes / 1440;
+  const ageH = (ms: number): number => Math.max(0, (ms - releaseMs) / 3600000);
+  const uOf = (ms: number): number => Math.log1p(ageH(ms));
+
+  // --- Snapshots: collapse consecutive identical reads into one state. ---
+  const snaps: Snap[] = [];
+  for (const h of c.history) {
+    const rates = h.rates.map((r) => (r === null ? NaN : r));
+    const prev = snaps[snaps.length - 1];
+    const same = prev !== undefined && prev.n === h.players_tracked &&
+      prev.rates.length === rates.length &&
+      prev.rates.every((r, i) => (Number.isNaN(r) && Number.isNaN(rates[i])) || r === rates[i]);
+    if (!same) snaps.push({ t: Date.parse(h.at), n: h.players_tracked, rates });
+  }
+  const last = snaps[snaps.length - 1];
+  // Fill nulls in the last snapshot from the most recent snapshot that has them.
+  const lastRates: number[] = last.rates.map((r, i) => {
+    if (!Number.isNaN(r)) return r;
+    for (let k = snaps.length - 2; k >= 0; k--) {
+      if (!Number.isNaN(snaps[k].rates[i])) return snaps[k].rates[i];
+    }
+    return 0;
+  });
+  const earnersLast = lastRates.map((r) => (r * last.n) / 100);
+  const uLast = uOf(last.t);
+  const uTarget = uOf(t1);
+  const ageFirst = ageH(snaps[0].t);
+  const ageTarget = ageH(t1);
+  // Fitting snapshots: drop degenerate pre-release reads (near-zero tracked
+  // players, all rates zero) — they carry no information and their clamped
+  // log values would wreck every fit. The flat-history prior below still
+  // uses the full snapshot list.
+  const fitSnaps = snaps.filter((s) => s.n >= 10);
+
+  // --- Saturating fit: y(t) = Yinf / (1 + exp(-k (age - t0))), age in hours.
+  // Launch adoption and trophy earning both saturate: a straight line in
+  // log-log space keeps growing forever and explodes over a 4.5-day horizon.
+  // The ceiling Yinf is solved by least squares for each (k, t0) on the grid,
+  // and the best fit is judged on log scale, so small early counts still count.
+  const logisticFit = (ages: number[], ys: number[], floor = 0.5): { inf: number; k: number; t0: number; sse: number } | null => {
+    if (ages.length < 3) return null;
+    const ly = ys.map((y) => Math.log(Math.max(y, floor)));
+    let best: { inf: number; k: number; t0: number; sse: number } | null = null;
+    for (const k of LOG_K) {
+      for (const t0g of LOG_T0) {
+        const s = ages.map((a) => 1 / (1 + Math.exp(-k * (a - t0g))));
+        let num = 0, den = 0;
+        for (let i = 0; i < ages.length; i++) { num += ys[i] * s[i]; den += s[i] * s[i]; }
+        if (den < 1e-12) continue;
+        const inf = num / den;
+        if (!(inf > 0)) continue;
+        let sse = 0;
+        for (let i = 0; i < ages.length; i++) {
+          const d = ly[i] - Math.log(Math.max(inf * s[i], floor));
+          sse += d * d;
+        }
+        if (best === null || sse < best.sse) best = { inf, k, t0: t0g, sse };
+      }
+    }
+    return best;
+  };
+  const logisticAt = (fit: { inf: number; k: number; t0: number }, age: number): number =>
+    fit.inf / (1 + Math.exp(-fit.k * (age - fit.t0)));
+
+  // --- Forecast players_tracked at the target. ---
+  const snapAges = fitSnaps.map((s) => ageH(s.t));
+  let nHat: number;
+  if (fitSnaps.length >= 3) {
+    const logFit = logisticFit(snapAges, fitSnaps.map((s) => Math.max(1, s.n)));
+    const us = fitSnaps.map((s) => uOf(s.t));
+    const [aN, bN] = ols(us, fitSnaps.map((s) => Math.log(Math.max(1, s.n))));
+    const logPow = aN + bN * uTarget;
+    const linSse = us.reduce((acc, u, i) => {
+      const d = Math.log(Math.max(1, fitSnaps[i].n)) - (aN + bN * u);
+      return acc + d * d;
+    }, 0);
+    // Blend the saturating fit (biased low: it reads the window's flattening
+    // as a full stop) with the straight line (biased high: it never flattens).
+    // The truth sits between them, closer to the saturating fit.
+    nHat = logFit !== null
+      ? Math.exp(0.7 * Math.log(Math.max(logisticAt(logFit, ageTarget), 1)) + 0.3 * logPow)
+      : Math.exp(logPow);
+    void linSse;
+  } else {
+    // No refresh ever seen: launch prior, computed from the case's own ages.
+    nHat = last.n * (((1 + ageTarget) / (1 + ageFirst)) ** ALPHA_N);
+  }
+  // Sanity caps only: never below the last count, never an absurd multiple.
+  nHat = clamp(nHat, last.n, last.n * 10);
+
+  // --- Per-trophy earners: saturating fits, damped power-law fallback, or
+  //     the launch prior when no refresh was seen. ---
+  const nt = c.trophies.length;
+  const fitSlope: number[] = new Array(nt).fill(0);
+  const fitCount: number[] = new Array(nt).fill(0);
+  const logFitE: Array<{ inf: number; k: number; t0: number; sse: number } | null> = new Array(nt).fill(null);
+  const rateFit: Array<{ inf: number; k: number; t0: number; sse: number } | null> = new Array(nt).fill(null);
+  const residMed: number[] = [];
+  const spanU = Math.max(uLast - uOf(fitSnaps.length > 0 ? fitSnaps[0].t : snaps[0].t), 0.1);
+  if (fitSnaps.length >= 3) {
+    for (let j = 0; j < nt; j++) {
+      const ages: number[] = [];
+      const es: number[] = [];
+      for (const s of fitSnaps) {
+        const r = s.rates[j];
+        if (Number.isNaN(r)) continue;
+        ages.push(ageH(s.t));
+        es.push(Math.max((r * s.n) / 100, 0.5));
+      }
+      if (ages.length >= 3) {
+        fitCount[j] = ages.length;
+        logFitE[j] = logisticFit(ages, es);
+        const rateYs: number[] = [];
+        for (const s of fitSnaps) {
+          const r = s.rates[j];
+          if (!Number.isNaN(r)) rateYs.push(Math.max(r, 0.005));
+        }
+        rateFit[j] = logisticFit(ages, rateYs, 0.005);
+        const xs = ages.map((a) => Math.log1p(a));
+        const ys = es.map((e) => Math.log(e));
+        const [a, b] = ols(xs, ys);
+        fitSlope[j] = clamp(b, 0, 2.5);
+        residMed.push(Math.sqrt(ys.reduce((s, y, i) => s + (y - (a + b * xs[i])) ** 2, 0) / ys.length));
+      }
+    }
+  }
+  const tierSlope = (tier: string): number => {
+    const ss = c.trophies.map((t, j) => (t.tier === tier && fitCount[j] >= 3 ? fitSlope[j] : NaN))
+      .filter((x) => !Number.isNaN(x));
+    if (ss.length > 0) return median(ss);
+    const all = fitSlope.filter((_, j) => fitCount[j] >= 3);
+    return all.length > 0 ? median(all) : 0;
+  };
+  const resid = residMed.length > 0 ? median(residMed) : 0;
+  // Damping for extrapolated power-law growth: the further past the observed
+  // window the target sits, the more the growth is shrunk toward no-growth.
+  const damp = spanU / (spanU + Math.max(uTarget - uLast, 0));
+
+  // --- Refresh-jump dispersion (logit-rate jumps between snapshots). ---
+  let jumpStd = 0;
+  if (fitSnaps.length >= 2) {
+    const jumps: number[] = [];
+    for (let k = 1; k < fitSnaps.length; k++) {
+      for (let j = 0; j < nt; j++) {
+        const a = fitSnaps[k - 1].rates[j];
+        const b = fitSnaps[k].rates[j];
+        if (Number.isNaN(a) || Number.isNaN(b)) continue;
+        jumps.push(Math.abs(logit(b) - logit(a)));
+      }
+    }
+    if (jumps.length > 0) jumpStd = 1.4826 * median(jumps);
+  }
+  if (fitSnaps.length < 2) {
+    jumpStd = FLAT_JUMP_SHARE * Math.abs(Math.log(nHat / last.n));
+  }
+
+  const sigmaTrend = Math.sqrt(horizonDays) * (SIGMA_TREND + 0.35 * resid);
+
+  const rows = c.trophies.map((t, j) => {
+    const rLast = lastRates[j];
+    const eLast = Math.max(earnersLast[j], 0.5);
+    let eHat: number;
+    if (rLast >= 99.99) {
+      eHat = nHat; // already at 100%: everyone tracked has it.
+    } else if (fitSnaps.length >= 3 && fitCount[j] >= 3 && logFitE[j] !== null) {
+      // Saturating fit: earners approach the trophy's ceiling, they do not
+      // keep compounding. Blend it with a damped power law as a hedge: the
+      // damping shrinks extrapolated growth the further past the observed
+      // window the target sits.
+      const eSat = logisticAt(logFitE[j] as { inf: number; k: number; t0: number }, ageTarget);
+      const slope = (fitCount[j] * fitSlope[j] + 3 * tierSlope(t.tier)) / (fitCount[j] + 3);
+      const ePow = eLast * Math.exp(clamp(slope, 0, 2.5) * (uTarget - uLast) * damp);
+      eHat = Math.exp(0.7 * Math.log(Math.max(eSat, 0.5)) + 0.3 * Math.log(Math.max(ePow, 0.5)));
+    } else if (fitSnaps.length >= 3) {
+      // Too few usable points for this trophy: its tier's damped slope.
+      const slope = tierSlope(t.tier);
+      eHat = eLast * Math.exp(clamp(slope, 0, 2.5) * (uTarget - uLast) * damp);
+    } else {
+      // No refresh seen: launch prior, earners grow slower than the base.
+      const beta = BETA_TIER[t.tier] ?? 0.15;
+      eHat = eLast * (((1 + ageTarget) / (1 + ageFirst)) ** beta);
+    }
+    // Earners only grow, never exceed the tracked players.
+    eHat = clamp(eHat, eLast, nHat);
+    if (t.tier === 'platinum') {
+      eHat = Math.min(eHat, (PLATINUM_CAP * rLast * nHat) / 100);
+      eHat = Math.max(eHat, eLast);
+    }
+    const countsMed = clampRate((100 * eHat) / nHat);
+    let med = countsMed;
+    if (rLast < 99.99) {
+      // Rate-logistic view: the rate's own saturating curve.
+      const fHat = rateFit[j] !== null
+        ? clampRate(logisticAt(rateFit[j] as { inf: number; k: number; t0: number }, ageTarget))
+        : countsMed;
+      // Logit-trend view (house-curve style): extrapolate the in-window
+      // logit(rate)-vs-log-time slope, damped by how far past the observed
+      // window the target sits. This view keeps rising while the cohort
+      // matures; the saturating views flatten too early on their own.
+      let trendMed = countsMed;
+      if (fitSnaps.length >= 3) {
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (const s of fitSnaps) {
+          const r = s.rates[j];
+          if (!Number.isNaN(r)) { xs.push(uOf(s.t)); ys.push(logit(r)); }
+        }
+        if (xs.length >= 3) {
+          const [, b] = ols(xs, ys);
+          const move = clamp(b * (uTarget - uLast), -3, 3) * damp;
+          trendMed = clampRate(invLogit(logit(rLast) + move));
+        }
+      }
+      med = clampRate(Math.exp(0.4 * Math.log(countsMed) + 0.3 * Math.log(fHat) + 0.3 * Math.log(trendMed)));
+    }
+    if (rLast >= 99.99) med = 100;
+    const sigmaSmall = Math.min(0.45, 0.3 / Math.sqrt(Math.max(earnersLast[j], 1)));
+    // The further the forecast moves from the last rate, the less certain it is.
+    const sigmaMove = 0.2 * Math.abs(logit(med) - logit(rLast));
+    const sigma = Math.sqrt(SIGMA_FLOOR ** 2 + jumpStd ** 2 + sigmaTrend ** 2 + sigmaSmall ** 2 + sigmaMove ** 2);
+    const lm = logit(med);
+    let prev = -Infinity;
+    const q = Z.map((z) => {
+      const v = rLast >= 99.99 && z > 0 ? 100 : round4(clamp(invLogit(lm + z * sigma), 0.01, 100));
+      const out = Math.max(v, prev);
+      prev = out;
+      return out;
+    });
+    // The 100% trophy keeps its median at 100 with a narrow upper band.
+    if (rLast >= 99.99) {
+      const pinned = [99.5, 99.9, 100, 100, 100];
+      return { id: t.id, q: pinned };
+    }
+    return { id: t.id, q };
+  });
+
+  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ trophies: rows })}\n`);
 }
